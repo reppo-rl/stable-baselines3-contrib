@@ -162,6 +162,7 @@ def train_reppo(
     seed: int,
     verbose: int,
     wandb_callback: Any = None,
+    tb_log_dir: str | None = None,
 ) -> REPPO:
     reppo_cfg = cfg["reppo"]
     train_env = make_vec_env(env_id, n_envs=n_envs, seed=seed)
@@ -191,6 +192,7 @@ def train_reppo(
         ),
         verbose=verbose,
         seed=seed,
+        tensorboard_log=tb_log_dir,
     )
 
     t0 = time.time()
@@ -355,10 +357,12 @@ def main() -> None:
             save_code=True,
         )
         wandb_callback = WandbCallback(verbose=0)
+        tb_log_dir = f"runs/{run.id}"
 
     # REPPO
     reppo_model = train_reppo(
-        env_id, cfg, total_timesteps, args.n_envs, args.seed, args.verbose, wandb_callback
+        env_id, cfg, total_timesteps, args.n_envs, args.seed, args.verbose,
+        wandb_callback, tb_log_dir if args.wandb else None,
     )
     print(f"\n>>> Evaluating REPPO ({args.n_eval_episodes} episodes, deterministic) ...")
     m, s = evaluate(reppo_model, env_id, args.n_eval_episodes)
