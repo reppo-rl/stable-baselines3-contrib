@@ -214,14 +214,6 @@ class REPPO(OnPolicyAlgorithm):
         rollout_buffer: RolloutBuffer,
         n_rollout_steps: int,
     ) -> bool:
-        """Override to store separate done/truncation arrays.
-
-        The reference implementation handles truncation bootstrapping inside
-        the GVE computation rather than adding γ*V(terminal) to the reward.
-        We therefore skip SB3's default truncation-reward-adjustment and
-        instead store the raw dones and truncation flags for use in
-        ``_compute_returns_and_advantage``.
-        """
         assert self._last_obs is not None, "No previous observation was provided"
         self.policy.set_training_mode(False)
 
@@ -236,18 +228,18 @@ class REPPO(OnPolicyAlgorithm):
 
         while n_steps < n_rollout_steps:
             with th.no_grad():
-                obs_tensor = obs_as_tensor(self._last_obs, self.device)
+                obs_tensor = obs_as_tensor(self._last_obs, self.device).float()
                 actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
 
-            clipped_actions = actions
+            
             if isinstance(self.action_space, spaces.Box):
                 if self.policy.squash_output:
-                    clipped_actions = self.policy.unscale_action(clipped_actions)
+                    actions= self.policy.unscale_action(actions)
                 else:
-                    clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+                    actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
-            new_obs, rewards, dones, infos = env.step(clipped_actions)
+            new_obs, rewards, dones, infos = env.step(actions)
             self.num_timesteps += env.num_envs
 
             callback.update_locals(locals())
@@ -260,7 +252,6 @@ class REPPO(OnPolicyAlgorithm):
             if isinstance(self.action_space, spaces.Discrete):
                 actions = actions.reshape(-1, 1)
 
-            # Determine which envs were truncated (not truly terminal)
             truncations = np.zeros_like(dones, dtype=np.float32)
             for idx, done in enumerate(dones):
                 if done and infos[idx].get("TimeLimit.truncated", False):
@@ -271,9 +262,6 @@ class REPPO(OnPolicyAlgorithm):
             # terminal = done AND NOT truncated
             self._rollout_dones[n_steps - 1] = dones.astype(np.float32)
             self._rollout_truncations[n_steps - 1] = truncations
-
-            # Do NOT add bootstrap to truncated rewards — the reference
-            # handles truncation inside compute_gve instead.
 
             rollout_buffer.add(
                 self._last_obs,
@@ -287,7 +275,7 @@ class REPPO(OnPolicyAlgorithm):
             self._last_episode_starts = dones
 
         with th.no_grad():
-            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))
+            values = self.policy.predict_values(obs_as_tensor(new_obs, self.device).float())
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
         callback.update_locals(locals())
@@ -321,7 +309,7 @@ class REPPO(OnPolicyAlgorithm):
             )
             self.old_policy.to(self.device)
 
-        # Copy current policy to old policy (θ' ← θ)
+        # Copy current policy to old policy (new_params -> old_params)
         self.old_policy.load_state_dict(self.policy.state_dict())
         self.old_policy.eval()
 
@@ -411,7 +399,7 @@ class REPPO(OnPolicyAlgorithm):
     ) -> dict[str, float]:
         """Update the critic network with HL-Gauss distributional loss + aux embedding loss.
 
-        Paper Eq 9: L_Q = CrossEntropy(Q_φ(x, a), Cat(G^λ)) + aux_coef * L_aux
+        Paper Eq 9: L_Q = CrossEntropy(Q_critic(x, a), Cat(G^lambda)) + aux_coef * L_aux
         Reference applies truncation_mask to both losses and combines them
         in a single backward pass.
         """
@@ -434,10 +422,11 @@ class REPPO(OnPolicyAlgorithm):
             * embedded_returns * th.log_softmax(value_logits, dim=-1)
         ).sum(-1).mean()
 
-        # Auxiliary embedding loss: ||predictor(encoder(x_t, a_t)) - sg(encoder(x_{t+1}, a_{t+1}))||²
-        # Reference masks with truncation_mask (not episode_starts-based)
+        # Auxiliary embedding loss: MSE(predictor(encoder(x_t, a_t)), sg(encoder(x_{t+1}, a_{t+1})))
+        # Masked at all episode boundaries (terminal + truncated) since encoder_feat_{t+1}
+        # crosses into a new episode and is not a valid prediction target.
         aux_loss = (
-            truncation_mask.unsqueeze(-1)
+            aux_mask.unsqueeze(-1)
             * (pred_embed - target_embeddings.detach()) ** 2
         ).mean()
 
@@ -465,8 +454,8 @@ class REPPO(OnPolicyAlgorithm):
         """Update the actor network.
 
         Paper Algorithm 1 / Eq 15 (clipped variant):
-        When KL < KL_tar: L = -Q(x, a') + e^α log π(a'|x)
-        When KL >= KL_tar: L = e^β D_KL(π_old || π_new)
+        When KL < KL_tar: L = -Q(x, a') + alpha * log_pi(a'|x)
+        When KL >= KL_tar: L = beta * D_KL(pi_old || pi_new)
         + temperature update losses (Eq 13-14)
         """
         # Get current policy distribution and sample new actions
@@ -476,30 +465,20 @@ class REPPO(OnPolicyAlgorithm):
         # Evaluate Q-values for sampled actions (pathwise gradient)
         on_policy_values = self.policy.q_net.evaluate_actions(obs, predicted_actions)
 
-        # Compute entropy: H[π] = -E[log π(a|x)]
-        log_prob = current_dist.log_prob(predicted_actions)
-        if log_prob.dim() > 1:
-            entropy = -log_prob.sum(-1)
-        else:
-            entropy = -log_prob
+        # Compute entropy: H[pi] = -E[log pi(a|x)]
+        # log_prob shape: (batch, action_dim) → sum over action dims
+        entropy = -current_dist.log_prob(predicted_actions).sum(-1)  # (batch,)
 
-        # KL divergence: D_KL(π_old || π_new) via multi-sample Monte Carlo
+        # KL divergence: D_KL(pi_old || pi_new) via multi-sample Monte Carlo
         # Sample kl_samples actions from old policy, evaluate under both
         with th.no_grad():
             old_dist = self.old_policy.q_net.get_action_dist(obs)
-            # (kl_samples, batch, action_dim) — detached from old policy
-            old_pi_actions = old_dist.sample((self.kl_samples,))
-            old_log_probs = old_dist.log_prob(old_pi_actions)
-            if old_log_probs.dim() > 2:
-                old_log_probs = old_log_probs.sum(-1)  # (kl_samples, batch)
-            old_log_probs = old_log_probs.mean(0)  # (batch,)
+            old_pi_actions = old_dist.sample((self.kl_samples,))  # (kl_samples, batch, action_dim)
+            old_log_probs = old_dist.log_prob(old_pi_actions).sum(-1).mean(0)  # (batch,)
 
-        new_log_probs = current_dist.log_prob(old_pi_actions.detach())
-        if new_log_probs.dim() > 2:
-            new_log_probs = new_log_probs.sum(-1)  # (kl_samples, batch)
-        new_log_probs = new_log_probs.mean(0)  # (batch,)
+        new_log_probs = current_dist.log_prob(old_pi_actions.detach()).sum(-1).mean(0)  # (batch,)
 
-        # D_KL(π_old || π_new) = E_old[log π_old - log π_new]
+        # D_KL(pi_old || pi_new) = E_old[log pi_old - log pi_new]
         kl_per_sample = old_log_probs.detach() - new_log_probs
         kl_divergence = kl_per_sample.mean()
 
@@ -548,12 +527,12 @@ class REPPO(OnPolicyAlgorithm):
 
         Reference GVE (backwards pass):
             truncated[-1] = 1.0
-            lambda_sum = λ * last_gve + (1 - λ) * next_values[t]
-            delta = γ * where(truncated[t], next_values[t], (1-dones[t]) * lambda_sum)
+            lambda_sum = gae_lambda * last_gve + (1 - gae_lambda) * next_values[t]
+            delta = gamma * where(truncated[t], next_values[t], (1-dones[t]) * lambda_sum)
             last_gve = rewards[t] + delta
 
         Entropy-adjusted rewards are computed as:
-            r̃_t = r_t - γ * α * log π(a_{t+1}|x_{t+1})
+            r_adj_t = r_t - gamma * alpha * log_pi(a_{t+1}|x_{t+1})
         matching the reference's collection-time adjustment.
         """
         buf = self.rollout_buffer
@@ -567,8 +546,8 @@ class REPPO(OnPolicyAlgorithm):
 
         # Precompute all Q-values, log_probs, and encoder features
         with th.no_grad():
-            all_obs = th.as_tensor(buf.observations, device=self.device)
-            all_act = th.as_tensor(buf.actions, device=self.device)
+            all_obs = th.as_tensor(buf.observations, device=self.device, dtype=th.float32)
+            all_act = th.as_tensor(buf.actions, device=self.device, dtype=th.float32)
 
             all_q_values = np.zeros_like(buf.rewards)
             all_log_probs = np.zeros_like(buf.rewards)
@@ -625,8 +604,10 @@ class REPPO(OnPolicyAlgorithm):
         # ------------------------------------------------------------------
         truncation_masks = 1.0 - truncations  # (n_steps, n_envs)
 
-        # Aux mask: same as truncation mask per reference (mask episode boundaries)
-        aux_masks = truncation_masks.copy()
+        # Aux mask: mask out ALL episode boundaries (terminal AND truncated).
+        # At any done step, encoder_feat_{t+1} is the start of a new episode — not a valid
+        # prediction target for the current episode's encoder features.
+        aux_masks = 1.0 - dones  # (n_steps, n_envs)
 
         # Flatten and store for minibatch access in train()
         total_size = self.n_steps * n_envs
@@ -653,7 +634,7 @@ class REPPO(OnPolicyAlgorithm):
                 next_values[step] = last_values
                 next_log_probs[step] = last_log_probs
 
-        # Entropy-adjusted rewards: r̃_t = r_t - γ * α * log π(a_{t+1}|x_{t+1})
+        # Entropy-adjusted rewards: r_adj_t = r_t - gamma * alpha * log_pi(a_{t+1}|x_{t+1})
         soft_rewards = buf.rewards - self.gamma * alpha_temp * next_log_probs
 
         # Reference GVE backward pass

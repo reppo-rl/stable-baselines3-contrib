@@ -88,6 +88,11 @@ class ActorQNetwork(nn.Module):
         vmax: float = 10.0,
         state_dependent_std: bool = True,
         log_std_init: float = 0.0,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
+        n_predictor_layers: int = 2,
+        alpha_temp_init: float = 0.1,
+        alpha_kl_init: float = 0.1,
     ):
         super().__init__()
         
@@ -98,12 +103,15 @@ class ActorQNetwork(nn.Module):
         self.vmax = vmax
         self.state_dependent_std = state_dependent_std
         self.activation_fn = activation_fn
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         
         # Build actor network
         actor_layers = []
         last_dim = observation_dim
         for hidden_dim in net_arch.get("pi", [256, 256, 256]):
             actor_layers.append(nn.Linear(last_dim, hidden_dim))
+            actor_layers.append(nn.LayerNorm(hidden_dim))
             actor_layers.append(activation_fn())
             last_dim = hidden_dim
         
@@ -124,6 +132,7 @@ class ActorQNetwork(nn.Module):
         critic_arch = net_arch.get("qf", [256, 256, 256])
         for hidden_dim in critic_arch[:-1]:
             critic_layers.append(nn.Linear(last_dim, hidden_dim))
+            critic_layers.append(nn.LayerNorm(hidden_dim))
             critic_layers.append(activation_fn())
             last_dim = hidden_dim
         
@@ -146,15 +155,16 @@ class ActorQNetwork(nn.Module):
         # Paper: ℒ_aux = ||f_p(ψ_t) - sg(ψ_{t+1})||²
         # where ψ = encoder output (critic features before HL-Gauss)
         encoder_dim = critic_arch[-1]
-        self.predictor = nn.Sequential(
-            nn.Linear(encoder_dim, encoder_dim),
-            activation_fn(),
-            nn.Linear(encoder_dim, encoder_dim),
-        )
+        predictor_layers = []
+        for i in range(n_predictor_layers):
+            predictor_layers.append(nn.Linear(encoder_dim, encoder_dim))
+            if i < n_predictor_layers - 1:
+                predictor_layers.append(activation_fn())
+        self.predictor = nn.Sequential(*predictor_layers)
 
         # Temperature parameters (trainable)
-        self.log_alpha_temp = nn.Parameter(th.log(th.tensor(0.1)), requires_grad=True)
-        self.log_alpha_kl = nn.Parameter(th.log(th.tensor(0.1)), requires_grad=True)
+        self.log_alpha_temp = nn.Parameter(th.log(th.tensor(alpha_temp_init)), requires_grad=True)
+        self.log_alpha_kl = nn.Parameter(th.log(th.tensor(alpha_kl_init)), requires_grad=True)
 
         # Distribution
         self.action_dist: TanhNormal | None = None
@@ -182,7 +192,7 @@ class ActorQNetwork(nn.Module):
             mean_and_logstd = self.actor(obs)
             mean = mean_and_logstd[..., :self.action_dim]
             log_std = mean_and_logstd[..., self.action_dim:]
-            log_std = th.clamp(log_std, min=-5.0, max=2.0)
+            log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (th.tanh(log_std) + 1.0)
             std = th.exp(log_std)
         else:
             mean = self.actor(obs)
@@ -207,12 +217,11 @@ class ActorQNetwork(nn.Module):
         return dist.sample()
     
     def _critic_encoder(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:
-        """Shared critic encoder: Linear → LayerNorm → Activation."""
+        """Shared critic encoder: Linear → LayerNorm → Activation, no final activation."""
         critic_input = th.cat([obs, actions], dim=-1)
         features = self.critic_features(critic_input)
         features = self.critic_final(features)
         features = self.critic_norm(features)
-        features = self.activation_fn()(features)
         return features
 
     def evaluate_actions(
@@ -308,6 +317,11 @@ class ActorQPolicy(BasePolicy):
         vmin: float = -10.0,
         vmax: float = 10.0,
         state_dependent_std: bool = True,
+        log_std_min: float = -5.0,
+        log_std_max: float = 2.0,
+        n_predictor_layers: int = 2,
+        alpha_temp_init: float = 0.1,
+        alpha_kl_init: float = 0.1,
         features_extractor_class: type[BaseFeaturesExtractor] = FlattenExtractor,
         features_extractor_kwargs: dict[str, Any] | None = None,
         normalize_images: bool = True,
@@ -341,6 +355,11 @@ class ActorQPolicy(BasePolicy):
         self.vmin = vmin
         self.vmax = vmax
         self.state_dependent_std = state_dependent_std
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+        self.n_predictor_layers = n_predictor_layers
+        self.alpha_temp_init = alpha_temp_init
+        self.alpha_kl_init = alpha_kl_init
         
         self._build(lr_schedule)
     
@@ -360,6 +379,11 @@ class ActorQPolicy(BasePolicy):
             vmin=self.vmin,
             vmax=self.vmax,
             state_dependent_std=self.state_dependent_std,
+            log_std_min=self.log_std_min,
+            log_std_max=self.log_std_max,
+            n_predictor_layers=self.n_predictor_layers,
+            alpha_temp_init=self.alpha_temp_init,
+            alpha_kl_init=self.alpha_kl_init,
         )
         
         # Setup optimizer
@@ -383,7 +407,7 @@ class ActorQPolicy(BasePolicy):
         - `values` has shape (batch, 1)
         - `log_prob` has shape (batch,) (or (batch, 1) for some spaces)
         """
-        # Use the raw observation tensor (already a torch tensor)
+        obs = obs.float()
         dist = self.q_net.get_action_dist(obs)
         if deterministic:
             actions = dist.mean
@@ -407,6 +431,7 @@ class ActorQPolicy(BasePolicy):
         """Return value estimates for given observations (shape: batch x 1)."""
         # Use deterministic mean action for value prediction
         with th.no_grad():
+            obs = obs.float()
             dist = self.q_net.get_action_dist(obs)
             mean_action = dist.mean
             values = self.q_net.evaluate_actions(obs, mean_action).unsqueeze(-1)
