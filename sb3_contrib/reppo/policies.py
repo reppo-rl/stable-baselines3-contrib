@@ -46,19 +46,10 @@ class TanhNormal:
         return th.tanh(self.normal.rsample(sample_shape))
 
     def log_prob(self, actions: th.Tensor) -> th.Tensor:
-        """Compute log probability of tanh-squashed actions.
-
-        Inverts the tanh to recover the pre-squash value, computes the
-        Gaussian log prob, then applies the Jacobian correction.
-        """
-        # Clip to valid atanh domain
         actions_clipped = actions.clamp(-1.0 + self.eps, 1.0 - self.eps)
-        # Inverse tanh
         pre_squash = th.atanh(actions_clipped)
-        # Gaussian log prob
         lp = self.normal.log_prob(pre_squash)
-        # Jacobian correction: log |d tanh / dx| = log(1 - tanh(x)^2)
-        lp = lp - th.log(1.0 - actions_clipped.pow(2) + self.eps)
+        lp = lp - th.log(1.0 - actions_clipped.pow(2) + self.eps)  # Jacobian correction
         return lp
 
 
@@ -106,7 +97,6 @@ class ActorQNetwork(nn.Module):
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
         
-        # Build actor network
         actor_layers = []
         last_dim = observation_dim
         for hidden_dim in net_arch.get("pi", [256, 256, 256]):
@@ -114,18 +104,15 @@ class ActorQNetwork(nn.Module):
             actor_layers.append(nn.LayerNorm(hidden_dim))
             actor_layers.append(activation_fn())
             last_dim = hidden_dim
-        
+
         if state_dependent_std:
-            # Output both mean and log_std
             actor_layers.append(nn.Linear(last_dim, 2 * action_dim))
             self.actor = nn.Sequential(*actor_layers)
         else:
-            # Output only mean, log_std is a parameter
             actor_layers.append(nn.Linear(last_dim, action_dim))
             self.actor = nn.Sequential(*actor_layers)
             self.log_std = nn.Parameter(th.ones(action_dim) * log_std_init, requires_grad=True)
-        
-        # Build critic network (takes obs + action as input)
+
         critic_input_dim = observation_dim + action_dim
         critic_layers = []
         last_dim = critic_input_dim
@@ -135,13 +122,11 @@ class ActorQNetwork(nn.Module):
             critic_layers.append(nn.LayerNorm(hidden_dim))
             critic_layers.append(activation_fn())
             last_dim = hidden_dim
-        
-        # Last layer before HL-Gauss
+
         self.critic_features = nn.Sequential(*critic_layers)
         self.critic_final = nn.Linear(last_dim, critic_arch[-1])
         self.critic_norm = nn.LayerNorm(critic_arch[-1])
-        
-        # Distributional critic output using HL-Gauss
+
         self.critic_embedding = HLGaussLayer(
             in_features=critic_arch[-1],
             min_value=vmin,
@@ -151,9 +136,6 @@ class ActorQNetwork(nn.Module):
             offset_mult=40.0,
         )
         
-        # Forward prediction head for auxiliary self-prediction loss
-        # Paper: ℒ_aux = ||f_p(ψ_t) - sg(ψ_{t+1})||²
-        # where ψ = encoder output (critic features before HL-Gauss)
         encoder_dim = critic_arch[-1]
         predictor_layers = []
         for i in range(n_predictor_layers):
@@ -162,21 +144,16 @@ class ActorQNetwork(nn.Module):
                 predictor_layers.append(activation_fn())
         self.predictor = nn.Sequential(*predictor_layers)
 
-        # Temperature parameters (trainable)
         self.log_alpha_temp = nn.Parameter(th.log(th.tensor(alpha_temp_init)), requires_grad=True)
         self.log_alpha_kl = nn.Parameter(th.log(th.tensor(alpha_kl_init)), requires_grad=True)
-
-        # Distribution
         self.action_dist: TanhNormal | None = None
         
     @property
     def alpha_temp(self) -> th.Tensor:
-        """Temperature parameter for entropy regularization."""
         return self.log_alpha_temp.exp()
-    
+
     @property
     def alpha_kl(self) -> th.Tensor:
-        """Temperature parameter for KL regularization."""
         return self.log_alpha_kl.exp()
     
     def get_action_dist(self, obs: th.Tensor) -> TanhNormal:
@@ -277,10 +254,7 @@ class ActorQNetwork(nn.Module):
         return q_value, logits, pred
 
     def get_encoder_features(self, obs: th.Tensor, actions: th.Tensor) -> th.Tensor:
-        """Get encoder representation ψ = f_φ(x, a) for auxiliary loss.
-
-        Returns the activated critic features before the HL-Gauss head.
-        """
+        """Critic encoder features before the HL-Gauss head (used for aux loss)."""
         return self._critic_encoder(obs, actions)
 
     def get_distribution(self, obs: th.Tensor) -> TanhNormal:
@@ -364,12 +338,9 @@ class ActorQPolicy(BasePolicy):
         self._build(lr_schedule)
     
     def _build(self, lr_schedule: Schedule) -> None:
-        """Build the networks."""
-        # Get observation and action dimensions
         obs_dim = self.observation_space.shape[0]
         action_dim = self.action_space.shape[0]
-        
-        # Create the network
+
         self.q_net = ActorQNetwork(
             observation_dim=obs_dim,
             action_dim=action_dim,
@@ -386,7 +357,6 @@ class ActorQPolicy(BasePolicy):
             alpha_kl_init=self.alpha_kl_init,
         )
         
-        # Setup optimizer
         self.optimizer = self.optimizer_class(
             self.parameters(), 
             lr=lr_schedule(1),
@@ -399,37 +369,19 @@ class ActorQPolicy(BasePolicy):
         return actions
 
     def forward(self, obs: th.Tensor, deterministic: bool = False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
-        """
-        Full policy forward compatible with SB3 `ActorCriticPolicy` interface.
-
-        Returns (actions, values, log_prob) where:
-        - `actions` has shape (batch, *action_shape)
-        - `values` has shape (batch, 1)
-        - `log_prob` has shape (batch,) (or (batch, 1) for some spaces)
-        """
+        """Returns (actions, values, log_prob) compatible with SB3 ActorCriticPolicy interface."""
         obs = obs.float()
         dist = self.q_net.get_action_dist(obs)
-        if deterministic:
-            actions = dist.mean
-        else:
-            actions = dist.sample()
-
-        # Ensure actions shape matches action space
+        actions = dist.mean if deterministic else dist.sample()
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
-
-        # Evaluate critic for these actions
         values = self.q_net.evaluate_actions(obs, actions).unsqueeze(-1)
-
-        # Log probability of actions
         log_prob = dist.log_prob(actions)
         if log_prob.dim() > 1:
             log_prob = log_prob.sum(-1)
-
         return actions, values, log_prob
 
     def predict_values(self, obs: th.Tensor) -> th.Tensor:
         """Return value estimates for given observations (shape: batch x 1)."""
-        # Use deterministic mean action for value prediction
         with th.no_grad():
             obs = obs.float()
             dist = self.q_net.get_action_dist(obs)

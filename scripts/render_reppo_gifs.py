@@ -1,10 +1,3 @@
-"""Train REPPO on three environments and render policy GIFs.
-
-Outputs (in scripts/gifs/):
-  pendulum_reppo.gif         — 200k steps, dense reward
-  mountaincar_reppo.gif      — 300k steps, sparse reward (failure case)
-  bipedal_reppo.gif          — 1M steps, locomotion
-"""
 
 import warnings
 from pathlib import Path
@@ -39,7 +32,6 @@ def train(env_id: str, policy_kwargs: dict, total_timesteps: int,
 
 def render_gif(model: REPPO, env_id: str, path: Path,
                n_episodes: int = 3, fps: int = 30) -> None:
-    """Roll out the deterministic policy and save frames as a GIF."""
     env = gym.make(env_id, render_mode="rgb_array")
     frames = []
     ep_returns = []
@@ -64,7 +56,7 @@ def render_gif(model: REPPO, env_id: str, path: Path,
           f"{n_episodes} eps, mean return={mean_r:.1f})")
 
 
-# ---------------------------------------------------------------------------
+
 
 CONFIGS = [
     {
