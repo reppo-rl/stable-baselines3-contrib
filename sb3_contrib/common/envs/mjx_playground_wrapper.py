@@ -9,12 +9,11 @@ from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvIndices, VecEnvObs, VecEnvStepReturn
 
-try:
-    import jax  # type: ignore[import-untyped]
-    import jax.numpy as jnp  # type: ignore[import-untyped]
-    _JAX_AVAILABLE = True
-except ImportError:
-    _JAX_AVAILABLE = False
+
+import jax  
+import jax.numpy as jnp  
+_JAX_AVAILABLE = True
+
 
 
 def jax_to_torch_gpu(x) -> torch.Tensor:
@@ -49,11 +48,6 @@ class MjxPlaygroundGymWrapper(gym.Env):
     ):
         super().__init__()
 
-        if not _JAX_AVAILABLE:
-            raise ImportError(
-                "JAX is required for MjxPlaygroundGymWrapper. "
-                "Install it with: pip install jax[cuda]  # or jax for CPU"
-            )
 
         try:
             from mujoco_playground import registry  # type: ignore[import-untyped]
@@ -384,23 +378,19 @@ class MjxPlaygroundVecEnv(VecEnv):
 
         dones = (terminated | truncated).cpu().numpy()
         rewards_np = rewards.cpu().numpy()
+        truncated_np = truncated.cpu().numpy()
         obs_np = self._to_numpy(obs)
 
-        infos: list[dict] = []
-        for i in range(self.num_envs):
-            info: dict[str, Any] = {}
-            if isinstance(raw_infos, dict):
-                for k, v in raw_infos.items():
-                    info[k] = v[i].cpu().numpy() if isinstance(v, torch.Tensor) else v
-            if dones[i]:
-                info["terminal_observation"] = (
-                    obs_np[i] if isinstance(obs_np, np.ndarray)
-                    else {k: v[i] for k, v in obs_np.items()}
-                )
-                info["TimeLimit.truncated"] = bool(truncated[i].item())
-            infos.append(info)
-
         done_indices = np.where(dones)[0].tolist()
+
+        infos: list[dict] = [{} for _ in range(self.num_envs)]
+        for i in done_indices:
+            infos[i]["terminal_observation"] = (
+                obs_np[i] if isinstance(obs_np, np.ndarray)
+                else {k: v[i] for k, v in obs_np.items()}
+            )
+            infos[i]["TimeLimit.truncated"] = bool(truncated_np[i])
+
         if done_indices:
             reset_obs, _ = self._gym.reset(options={"env_idx": done_indices})
             reset_np = self._to_numpy(reset_obs)
