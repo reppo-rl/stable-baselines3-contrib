@@ -224,12 +224,16 @@ class MjxPlaygroundGymWrapper(gym.Env):
 
     def _sync_mjx_to_mujoco(self) -> None:
         import mujoco
+        pipeline_state = getattr(self._state, "pipeline_state", None) or getattr(self._state, "data", None)
+        if pipeline_state is None:
+            print(f"[DEBUG] State attrs: {[a for a in dir(self._state) if not a.startswith('_')]}")
+            return
         try:
             from mujoco import mjx
-            mjx.get_data_into(self._mj_data, self._mj_model, jax.tree_util.tree_map(lambda x: x[0], self._state.pipeline_state))
+            mjx.get_data_into(self._mj_data, self._mj_model, jax.tree_util.tree_map(lambda x: x[0], pipeline_state))
         except Exception:
-            qpos = np.asarray(self._state.pipeline_state.qpos[0])
-            qvel = np.asarray(self._state.pipeline_state.qvel[0])
+            qpos = np.asarray(pipeline_state.qpos[0])
+            qvel = np.asarray(pipeline_state.qvel[0])
             self._mj_data.qpos[:] = qpos
             self._mj_data.qvel[:] = qvel
             mujoco.mj_forward(self._mj_model, self._mj_data)
@@ -355,6 +359,8 @@ class MjxPlaygroundVecEnv(VecEnv):
 
         self._actions: np.ndarray | None = None
         self._torch_device = torch.device(gym_wrapper.device)
+        self._ep_rewards = np.zeros(n, dtype=np.float32)
+        self._ep_lengths = np.zeros(n, dtype=np.int32)
 
     @staticmethod
     def _strip_batch_dim(space: spaces.Space, n: int) -> spaces.Space:
@@ -367,6 +373,8 @@ class MjxPlaygroundVecEnv(VecEnv):
 
     def reset(self) -> VecEnvObs:
         obs, _ = self._gym.reset()
+        self._ep_rewards[:] = 0.0
+        self._ep_lengths[:] = 0
         return self._to_numpy(obs)
 
     def step_async(self, actions: np.ndarray) -> None:
@@ -381,6 +389,9 @@ class MjxPlaygroundVecEnv(VecEnv):
         truncated_np = truncated.cpu().numpy()
         obs_np = self._to_numpy(obs)
 
+        self._ep_rewards += rewards_np
+        self._ep_lengths += 1
+
         done_indices = np.where(dones)[0].tolist()
 
         infos: list[dict] = [{} for _ in range(self.num_envs)]
@@ -390,6 +401,9 @@ class MjxPlaygroundVecEnv(VecEnv):
                 else {k: v[i] for k, v in obs_np.items()}
             )
             infos[i]["TimeLimit.truncated"] = bool(truncated_np[i])
+            infos[i]["episode"] = {"r": float(self._ep_rewards[i]), "l": int(self._ep_lengths[i])}
+            self._ep_rewards[i] = 0.0
+            self._ep_lengths[i] = 0
 
         if done_indices:
             reset_obs, _ = self._gym.reset(options={"env_idx": done_indices})

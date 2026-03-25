@@ -129,14 +129,50 @@ def train(cfg: dict) -> REPPO:
     model.save(save_path)
     print(f"Model saved → {save_path}")
 
-    os.makedirs("scripts/gifs", exist_ok=True)
-    gif_path = f"scripts/gifs/reppo_{cfg['env_name']}_{run.id}.gif"
-    mean_return = render_gif(model, cfg, gif_path, n_episodes=3, fps=30)
-    wandb.summary["eval_mean_return"] = mean_return
-    wandb.log({"eval/gif": wandb.Video(gif_path, fps=30, format="gif")})
+    print("\nRunning deterministic eval (10 episodes)...")
+    mean_return, std_return = eval_policy(model, cfg, n_episodes=10)
+    print(f"Eval: mean={mean_return:.1f}  std={std_return:.1f}")
+    wandb.summary["mean_return"] = mean_return
+    wandb.summary["std_return"] = std_return
+
+    try:
+        os.makedirs("scripts/gifs", exist_ok=True)
+        gif_path = f"scripts/gifs/reppo_{cfg['env_name']}_{run.id}.gif"
+        render_gif(model, cfg, gif_path, n_episodes=3, fps=30)
+        wandb.log({"eval/gif": wandb.Video(gif_path, fps=30, format="gif")})
+    except Exception as e:
+        print(f"Gif rendering failed (skipping): {e}")
 
     run.finish()
     return model
+
+
+def eval_policy(model: REPPO, cfg: dict, n_episodes: int = 10) -> tuple[float, float]:
+    import torch
+    eval_env = MjxPlaygroundGymWrapper(
+        env_name=cfg["env_name"],
+        num_envs=1,
+        seed=cfg["seed"] + 999,
+        device=cfg["device"],
+        max_episode_steps=cfg["max_episode_steps"],
+        config_overrides={"impl": "jax"},
+    )
+    ep_returns = []
+    for ep in range(n_episodes):
+        obs_np, _ = eval_env.reset(seed=ep)
+        obs = obs_np[0]
+        ep_return = 0.0
+        done = False
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            action_t = torch.as_tensor(action, dtype=torch.float32).unsqueeze(0)
+            obs_np, reward, terminated, truncated, _ = eval_env.step(action_t)
+            obs = obs_np[0]
+            ep_return += float(reward[0].item())
+            done = bool((terminated | truncated)[0].item())
+        ep_returns.append(ep_return)
+    eval_env.close()
+    return float(np.mean(ep_returns)), float(np.std(ep_returns))
 
 
 def render_gif(model: REPPO, cfg: dict, gif_path: str, n_episodes: int = 3, fps: int = 30) -> None:
