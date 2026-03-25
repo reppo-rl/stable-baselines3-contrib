@@ -147,6 +147,7 @@ def render_gif(model: REPPO, cfg: dict, gif_path: str, n_episodes: int = 3, fps:
         device=cfg["device"],
         max_episode_steps=cfg["max_episode_steps"],
         render_mode="rgb_array",
+        config_overrides={"impl": "jax"},
     )
 
     frames = []
