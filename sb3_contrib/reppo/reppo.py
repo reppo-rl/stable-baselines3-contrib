@@ -119,8 +119,8 @@ class REPPO(OnPolicyAlgorithm):
             n_steps=n_steps,
             gamma=gamma,
             gae_lambda=gae_lambda,
-            ent_coef=0.0,  # Not used in REPPO (handled by temperature)
-            vf_coef=0.0,   # Not used (separate critic update)
+            ent_coef=0.0,  
+            vf_coef=0.0,   
             max_grad_norm=max_grad_norm,
             use_sde=False,
             sde_sample_freq=-1,
@@ -513,7 +513,7 @@ class REPPO(OnPolicyAlgorithm):
         buf.advantages = returns - buf.values
 
     def _excluded_save_params(self) -> list[str]:
-        return super()._excluded_save_params() + [  # noqa: RUF005
+        return super()._excluded_save_params() + [  
             "old_policy",
             "_rollout_dones",
             "_rollout_truncations",
