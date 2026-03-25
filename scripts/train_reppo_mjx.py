@@ -25,7 +25,7 @@ CONFIGS = [
         "seed": 42,
         "max_episode_steps": 1000,
         "total_timesteps": 500_000_000,
-        "n_steps": 64,
+        "n_steps": 42,
         "batch_size": 16384,
         "n_epochs": 8,
         "gamma": 0.99,
