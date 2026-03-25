@@ -24,10 +24,10 @@ CONFIGS = [
         "device": "cuda",
         "seed": 42,
         "max_episode_steps": 1000,
-        "total_timesteps": 100_000_000,
-        "n_steps": 32,
+        "total_timesteps": 500_000_000,
+        "n_steps": 64,
         "batch_size": 16384,
-        "n_epochs": 4,
+        "n_epochs": 8,
         "gamma": 0.99,
         "gae_lambda": 0.95,
         "learning_rate": 3e-4,
@@ -157,17 +157,22 @@ def eval_policy(model: REPPO, cfg: dict, n_episodes: int = 10) -> tuple[float, f
         max_episode_steps=cfg["max_episode_steps"],
         config_overrides={"impl": "jax"},
     )
+    def _to_numpy_obs(o):
+        if isinstance(o, torch.Tensor):
+            return o.cpu().numpy()
+        return {k: v.cpu().numpy() for k, v in o.items()}
+
     ep_returns = []
     for ep in range(n_episodes):
-        obs_np, _ = eval_env.reset(seed=ep)
-        obs = obs_np[0]
+        obs_raw, _ = eval_env.reset(seed=ep)
+        obs = _to_numpy_obs(obs_raw)[0]
         ep_return = 0.0
         done = False
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             action_t = torch.as_tensor(action, dtype=torch.float32).unsqueeze(0)
-            obs_np, reward, terminated, truncated, _ = eval_env.step(action_t)
-            obs = obs_np[0]
+            obs_raw, reward, terminated, truncated, _ = eval_env.step(action_t)
+            obs = _to_numpy_obs(obs_raw)[0]
             ep_return += float(reward[0].item())
             done = bool((terminated | truncated)[0].item())
         ep_returns.append(ep_return)
