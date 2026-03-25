@@ -49,7 +49,7 @@ def make_env(cfg: dict) -> MjxPlaygroundVecEnv:
         seed=cfg["seed"],
         device=cfg["device"],
         max_episode_steps=cfg["max_episode_steps"],
-        config_overrides={"impl": "mjx"},
+        config_overrides={"impl": "jax"},
     )
     return MjxPlaygroundVecEnv(gym_env)
 
