@@ -33,11 +33,11 @@ CONFIGS = [
         "learning_rate": 3e-4,
         "critic_learning_rate": 3e-4,
         "ent_target_mult": -0.5,
-        "desired_kl": 0.2,
+        "desired_kl": 0.1,
         "kl_samples": 8,
-        "vmin": -1000.0,
-        "vmax": 1000.0,
-        "net_arch": {"pi": [256, 256, 256], "qf": [256, 256, 256]},
+        "vmin": -100.0,
+        "vmax": 100.0,
+        "net_arch": {"pi": [512, 512, 512], "qf": [512, 512, 512]},
     },
 ]
 
@@ -96,7 +96,7 @@ def train(cfg: dict) -> REPPO:
         desired_kl=cfg["desired_kl"],
         kl_samples=cfg["kl_samples"],
         aux_coef=1.0,
-        max_grad_norm=1.0,
+        max_grad_norm=0.5,
         policy_kwargs=dict(
             net_arch=cfg["net_arch"],
             vmin=cfg["vmin"],
@@ -128,8 +128,7 @@ def train(cfg: dict) -> REPPO:
     save_path = f"models/reppo_{cfg['env_name']}_{run.id}"
     model.save(save_path)
     print(f"Model saved → {save_path}")
-
-    print("\nRunning deterministic eval (10 episodes)...")
+    
     mean_return, std_return = eval_policy(model, cfg, n_episodes=10)
     print(f"Eval: mean={mean_return:.1f}  std={std_return:.1f}")
     wandb.summary["mean_return"] = mean_return
