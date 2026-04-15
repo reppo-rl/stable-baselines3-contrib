@@ -80,6 +80,7 @@ def test_reppo():
         n_steps=64,
         batch_size=32,
         n_epochs=2,
+        aux_coef=0.0,
         verbose=1,
     )
     model.learn(total_timesteps=128)

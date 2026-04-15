@@ -1,15 +1,3 @@
-"""REPPO (Relative Entropy Pathwise Policy Optimization) for Stable-Baselines3.
-
-REPPO is an advanced RL algorithm that combines:
-- Distributional value functions using HL-Gauss encoding
-- Entropy-regularized policy optimization
-- KL-divergence based policy updates
-- Separate actor and critic update phases
-
-Paper: https://arxiv.org/abs/2507.11019
-Reference: https://github.com/cvoelcker/reppo
-"""
-
 from typing import Any, ClassVar, TypeVar
 import warnings
 
@@ -35,34 +23,27 @@ class REPPO(OnPolicyAlgorithm):
 
     Paper: https://arxiv.org/pdf/2507.11019
 
-    :param policy: The policy model to use (ActorQPolicy, MlpPolicy)
-    :param env: The environment to learn from (if registered in Gym, can be str)
-    :param learning_rate: The learning rate, it can be a function
-        of the current progress remaining (from 1 to 0)
-    :param critic_learning_rate: Learning rate for critic optimizer.
-        If None, uses the same as learning_rate.
-    :param n_steps: The number of steps to run for each environment per update
+    :param policy: The policy model to use (MlpPolicy, ActorQPolicy)
+    :param env: The environment to learn from
+    :param learning_rate: Actor learning rate, can be a schedule
+    :param critic_learning_rate: Critic learning rate; defaults to learning_rate
+    :param n_steps: Steps per environment per rollout
     :param batch_size: Minibatch size
-    :param n_epochs: Number of epoch when optimizing the surrogate loss
+    :param n_epochs: Number of gradient epochs per rollout
     :param gamma: Discount factor
-    :param gae_lambda: Factor for trade-off of bias vs variance for TD-lambda returns
-    :param target_entropy: Target entropy for automatic temperature adjustment.
-        If None, will use dim(action_space) * ent_target_mult as default.
-    :param ent_target_mult: Multiplier for default target entropy (default: -0.5).
-        Target entropy = action_dim * ent_target_mult. Only used when target_entropy is None.
-        Should be negative so the dual-gradient temperature update converges.
-    :param desired_kl: Desired KL divergence threshold for policy updates
-    :param kl_samples: Number of action samples from old policy for Monte Carlo KL estimation
+    :param gae_lambda: TD-lambda factor for return estimation
+    :param target_entropy: Target entropy for temperature update; defaults to action_dim * ent_target_mult
+    :param ent_target_mult: Multiplier for default target entropy
+    :param desired_kl: Target KL divergence for the KL lagrangian
+    :param kl_samples: Monte Carlo samples for KL estimation
     :param aux_coef: Coefficient for auxiliary self-prediction loss
-    :param max_grad_norm: The maximum value for the gradient clipping
-    :param rollout_buffer_class: Rollout buffer class to use.
-    :param rollout_buffer_kwargs: Keyword arguments to pass to the rollout buffer
-    :param stats_window_size: Window size for the rollout logging
-    :param tensorboard_log: the log location for tensorboard (if None, no logging)
-    :param policy_kwargs: additional arguments to be passed to the policy on creation
+    :param max_grad_norm: Gradient clipping threshold
+    :param stats_window_size: Window size for episode reward logging
+    :param tensorboard_log: Tensorboard log directory
+    :param policy_kwargs: Extra arguments passed to the policy
     :param verbose: Verbosity level
-    :param seed: Seed for the pseudo random generators
-    :param device: Device on which the code should be run
+    :param seed: Random seed
+    :param device: Device to run on
     :param _init_setup_model: Whether to build the network at creation
     """
 
@@ -103,7 +84,6 @@ class REPPO(OnPolicyAlgorithm):
         if target_entropy is not None:
             self.target_entropy = target_entropy
         elif env is None:
-            # env is None during load(), target_entropy will be set from saved data
             self.target_entropy = None
         elif isinstance(env, str):
             temp_env = gym.make(env)
@@ -119,8 +99,8 @@ class REPPO(OnPolicyAlgorithm):
             n_steps=n_steps,
             gamma=gamma,
             gae_lambda=gae_lambda,
-            ent_coef=0.0,  
-            vf_coef=0.0,   
+            ent_coef=0.0,
+            vf_coef=0.0,
             max_grad_norm=max_grad_norm,
             use_sde=False,
             sde_sample_freq=-1,
@@ -136,14 +116,16 @@ class REPPO(OnPolicyAlgorithm):
             supported_action_spaces=(gym.spaces.Box,),
         )
 
-        assert (
-            batch_size > 1
-        ), "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
+        assert batch_size > 1, (
+            "`batch_size` must be greater than 1. "
+            "See https://github.com/DLR-RM/stable-baselines3/issues/440"
+        )
 
         if self.env is not None:
             buffer_size = self.env.num_envs * self.n_steps
             assert buffer_size > 1, (
-                f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
+                f"`n_steps * n_envs` must be greater than 1. "
+                f"Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
             )
             untruncated_batches = buffer_size // batch_size
             if buffer_size % batch_size > 0:
@@ -173,21 +155,12 @@ class REPPO(OnPolicyAlgorithm):
         self._create_optimizers()
 
     def _create_optimizers(self) -> None:
-        actor_params = list(self.policy.q_net.actor.parameters())
-        if not self.policy.q_net.state_dependent_std and hasattr(self.policy.q_net, 'log_std'):
-            actor_params.append(self.policy.q_net.log_std)
-        actor_params.extend([
+        actor_params = list(self.policy.q_net.actor.parameters()) + [
             self.policy.q_net.log_alpha_temp,
             self.policy.q_net.log_alpha_kl,
-        ])
-
-        critic_params = (
-            list(self.policy.q_net.critic_features.parameters())
-            + list(self.policy.q_net.critic_final.parameters())
-            + list(self.policy.q_net.critic_norm.parameters())
-            + list(self.policy.q_net.critic_embedding.parameters())
-            + list(self.policy.q_net.predictor.parameters())
-        )
+        ]
+        actor_ids = {id(p) for p in actor_params}
+        critic_params = [p for p in self.policy.q_net.parameters() if id(p) not in actor_ids]
 
         lr = self.lr_schedule(1)
         critic_lr = self.critic_learning_rate if self.critic_learning_rate is not None else lr
@@ -212,6 +185,9 @@ class REPPO(OnPolicyAlgorithm):
 
         self._rollout_dones = np.zeros((n_rollout_steps, env.num_envs), dtype=np.float32)
         self._rollout_truncations = np.zeros((n_rollout_steps, env.num_envs), dtype=np.float32)
+        self._rollout_next_values = np.zeros((n_rollout_steps, env.num_envs), dtype=np.float32)
+        self._rollout_next_log_probs = np.zeros((n_rollout_steps, env.num_envs), dtype=np.float32)
+        self._rollout_next_embeddings: list[th.Tensor] = []
 
         callback.on_rollout_start()
 
@@ -221,10 +197,9 @@ class REPPO(OnPolicyAlgorithm):
                 actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
 
-            
             if isinstance(self.action_space, spaces.Box):
                 if self.policy.squash_output:
-                    actions= self.policy.unscale_action(actions)
+                    actions = self.policy.unscale_action(actions)
                 else:
                     actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
@@ -248,6 +223,27 @@ class REPPO(OnPolicyAlgorithm):
 
             self._rollout_dones[n_steps - 1] = dones.astype(np.float32)
             self._rollout_truncations[n_steps - 1] = truncations
+
+            next_obs = new_obs.copy()
+            for idx in range(env.num_envs):
+                if dones[idx]:
+                    terminal_obs = infos[idx].get("terminal_observation")
+                    if terminal_obs is not None:
+                        next_obs[idx] = terminal_obs
+
+            with th.no_grad():
+                next_obs_tensor = obs_as_tensor(next_obs, self.device).float()
+                next_dist = self.policy.q_net.get_action_dist(next_obs_tensor)
+                next_actions = next_dist.sample().clamp(-1 + 1e-6, 1 - 1e-6)
+                next_lp = next_dist.log_prob(next_actions)
+                if next_lp.dim() > 1:
+                    next_lp = next_lp.sum(-1)
+                next_val = self.policy.q_net.evaluate_actions(next_obs_tensor, next_actions)
+                next_embed = self.policy.q_net.get_encoder_features(next_obs_tensor, next_actions)
+
+            self._rollout_next_values[n_steps - 1] = next_val.cpu().numpy()
+            self._rollout_next_log_probs[n_steps - 1] = next_lp.cpu().numpy()
+            self._rollout_next_embeddings.append(next_embed)
 
             rollout_buffer.add(
                 self._last_obs,
@@ -286,9 +282,8 @@ class REPPO(OnPolicyAlgorithm):
                 **(self.policy_kwargs or {})
             )
             self.old_policy.to(self.device)
-
-        self.old_policy.load_state_dict(self.policy.state_dict())
-        self.old_policy.eval()
+            self.old_policy.load_state_dict(self.policy.state_dict())
+            self.old_policy.eval()
 
         self._compute_returns_and_advantage()
 
@@ -320,8 +315,7 @@ class REPPO(OnPolicyAlgorithm):
 
                 critic_metrics = self._update_critic(
                     batch_obs, batch_act, batch_ret,
-                    batch_target_embed, batch_aux_mask,
-                    batch_trunc_mask,
+                    batch_target_embed, batch_aux_mask, batch_trunc_mask,
                 )
                 critic_losses.append(critic_metrics["critic_loss"])
                 aux_losses.append(critic_metrics["aux_loss"])
@@ -332,12 +326,17 @@ class REPPO(OnPolicyAlgorithm):
                 entropies.append(actor_metrics["entropy"])
                 kl_divergences.append(actor_metrics["kl_divergence"])
 
+        self.old_policy.load_state_dict(self.policy.state_dict())
+        self.old_policy.eval()
+
         self._n_updates += self.n_epochs
         explained_var = explained_variance(
             self.rollout_buffer.values.flatten(),
             self.rollout_buffer.returns.flatten()
         )
 
+        self.logger.record("rollout/mean_reward", float(np.mean(buf.rewards)))
+        self.logger.record("rollout/mean_return_target", float(np.mean(buf.returns)))
         self.logger.record("train/entropy", np.mean(entropies))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
@@ -349,9 +348,6 @@ class REPPO(OnPolicyAlgorithm):
         self.logger.record("train/alpha_temp", self.policy.q_net.alpha_temp.item())
         self.logger.record("train/alpha_kl", self.policy.q_net.alpha_kl.item())
         self.logger.record("train/target_entropy", self.target_entropy)
-
-        if hasattr(self.policy.q_net, "log_std"):
-            self.logger.record("train/std", th.exp(self.policy.q_net.log_std).mean().item())
 
     def _update_critic(
         self,
@@ -377,8 +373,8 @@ class REPPO(OnPolicyAlgorithm):
         ).sum(-1).mean()
 
         aux_loss = (
-            aux_mask.unsqueeze(-1)
-            * (pred_embed - target_embeddings.detach()) ** 2
+            aux_mask
+            * ((pred_embed - target_embeddings.detach()) ** 2).mean(dim=-1)
         ).mean()
 
         total_loss = value_loss + self.aux_coef * aux_loss
@@ -390,49 +386,48 @@ class REPPO(OnPolicyAlgorithm):
         )
         self.critic_optimizer.step()
 
-        value_prediction_error = (value_pred.view(-1) - returns.view(-1)).abs().mean().item()
-
         return {
             "critic_loss": value_loss.item(),
             "aux_loss": aux_loss.item(),
-            "value_prediction_error": value_prediction_error,
+            "value_prediction_error": (value_pred.view(-1) - returns.view(-1)).abs().mean().item(),
         }
 
     def _update_actor(self, obs: th.Tensor) -> dict[str, float]:
-        current_dist = self.policy.q_net.get_action_dist(obs)
-        predicted_actions = current_dist.sample()
-        on_policy_values = self.policy.q_net.evaluate_actions(obs, predicted_actions)
-        entropy = -current_dist.log_prob(predicted_actions).sum(-1)
+        dist, _, temperature, beta = self.policy.q_net.forward_actor(obs)
 
         with th.no_grad():
-            old_dist = self.old_policy.q_net.get_action_dist(obs)
-            old_pi_actions = old_dist.sample((self.kl_samples,))
+            old_dist, _, _, _ = self.old_policy.q_net.forward_actor(obs)
+            old_pi_actions = old_dist.sample((self.kl_samples,)).clamp(-1 + 1e-6, 1 - 1e-6)
             old_log_probs = old_dist.log_prob(old_pi_actions).sum(-1).mean(0)
 
-        new_log_probs = current_dist.log_prob(old_pi_actions.detach()).sum(-1).mean(0)
+        new_log_probs = dist.log_prob(old_pi_actions.detach()).sum(-1).mean(0)
         kl_per_sample = old_log_probs.detach() - new_log_probs
         kl_divergence = kl_per_sample.mean()
 
-        normal_loss = -on_policy_values.view(-1) - self.policy.q_net.alpha_temp.detach() * entropy
-        policy_loss = th.where(
-            kl_per_sample < self.desired_kl,
-            normal_loss,
-            kl_per_sample * self.policy.q_net.alpha_kl.detach(),
-        ).mean()
+        if kl_divergence.item() < self.desired_kl:
+            actions = dist.rsample()
+            log_probs = dist.log_prob(actions.clamp(-1 + 1e-6, 1 - 1e-6)).sum(-1)
+            on_policy_values = self.policy.q_net.evaluate_actions(obs, actions)
+            policy_loss = (-on_policy_values.view(-1) + temperature.detach() * log_probs).mean()
+        else:
+            log_probs = dist.log_prob(dist.rsample().clamp(-1 + 1e-6, 1 - 1e-6)).sum(-1)
+            policy_loss = (beta.detach() * kl_per_sample).mean()
 
-        temp_target_loss = self.policy.q_net.alpha_temp * (self.target_entropy + entropy.mean()).detach()
-        kl_target_loss = -self.policy.q_net.alpha_kl * (kl_divergence - self.desired_kl).detach()
-        actor_loss = policy_loss + temp_target_loss + kl_target_loss
+        entropy = -log_probs.detach()
+        entropy_loss = temperature * (self.target_entropy + entropy).mean()
+        lagrange_loss = -beta * (kl_divergence - self.desired_kl).detach()
+
+        total_loss = policy_loss + entropy_loss + lagrange_loss
 
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        total_loss.backward()
         th.nn.utils.clip_grad_norm_(
             self.actor_optimizer.param_groups[0]["params"], self.max_grad_norm
         )
         self.actor_optimizer.step()
 
         return {
-            "actor_loss": actor_loss.item(),
+            "actor_loss": total_loss.item(),
             "entropy": entropy.mean().item(),
             "kl_divergence": kl_divergence.item(),
         }
@@ -445,50 +440,20 @@ class REPPO(OnPolicyAlgorithm):
         truncations = self._rollout_truncations
         terminals = dones * (1.0 - truncations)
 
-        with th.no_grad():
-            all_obs = th.as_tensor(buf.observations, device=self.device, dtype=th.float32)
-            all_act = th.as_tensor(buf.actions, device=self.device, dtype=th.float32)
+        next_values = self._rollout_next_values
+        next_log_probs = self._rollout_next_log_probs
 
-            obs_2d = all_obs.reshape(self.n_steps * n_envs, -1)
-            act_2d = all_act.reshape(self.n_steps * n_envs, -1)
-
-            dist = self.policy.q_net.get_action_dist(obs_2d)
-            sampled_actions = dist.sample()
-            lp = dist.log_prob(sampled_actions)
-            if lp.dim() > 1:
-                lp = lp.sum(-1)
-            all_log_probs = lp.cpu().numpy().reshape(self.n_steps, n_envs)
-            all_q_values = self.policy.q_net.evaluate_actions(obs_2d, sampled_actions).cpu().numpy().reshape(self.n_steps, n_envs)
-            enc_flat = self.policy.q_net.get_encoder_features(obs_2d, act_2d)
-            feat_3d = enc_flat.reshape(self.n_steps, n_envs, -1)
-
-            last_obs = th.as_tensor(self._last_obs, device=self.device, dtype=th.float32)
-            last_dist = self.policy.q_net.get_action_dist(last_obs)
-            last_actions = last_dist.sample()
-            last_lp = last_dist.log_prob(last_actions)
-            if last_lp.dim() > 1:
-                last_lp = last_lp.sum(-1)
-            last_log_probs = last_lp.cpu().numpy()
-            last_values = self.policy.q_net.evaluate_actions(last_obs, last_actions).cpu().numpy()
-            last_feat = self.policy.q_net.get_encoder_features(last_obs, last_actions)
-
-        encoder_stack = th.cat([feat_3d, last_feat.unsqueeze(0)], dim=0)
-        target_embeddings = encoder_stack[1:]
-
+        target_embed_flat = th.cat(self._rollout_next_embeddings, dim=0)
         truncation_masks = 1.0 - truncations
-        aux_masks = 1.0 - dones
+        aux_masks = 1.0 - truncations
 
         total_size = self.n_steps * n_envs
-        self._target_embeddings = target_embeddings.reshape(total_size, -1)
+        self._target_embeddings = target_embed_flat
         self._aux_masks = th.as_tensor(aux_masks, device=self.device, dtype=th.float32).reshape(total_size)
         self._truncation_masks = th.as_tensor(truncation_masks, device=self.device, dtype=th.float32).reshape(total_size)
 
         alpha_temp = self.policy.q_net.alpha_temp.item()
-
-        next_values = np.concatenate([all_q_values[1:], last_values[np.newaxis]], axis=0)
-        next_log_probs = np.concatenate([all_log_probs[1:], last_log_probs[np.newaxis]], axis=0)
-
-        soft_rewards = buf.rewards - self.gamma * alpha_temp * next_log_probs
+        soft_rewards = buf.rewards - self.gamma * alpha_temp * next_log_probs * (1.0 - terminals)
 
         trunc = truncations.copy()
         trunc[-1] = 1.0
@@ -513,18 +478,20 @@ class REPPO(OnPolicyAlgorithm):
         buf.advantages = returns - buf.values
 
     def _excluded_save_params(self) -> list[str]:
-        return super()._excluded_save_params() + [  
+        return super()._excluded_save_params() + [
             "old_policy",
             "_rollout_dones",
             "_rollout_truncations",
+            "_rollout_next_values",
+            "_rollout_next_log_probs",
+            "_rollout_next_embeddings",
             "_target_embeddings",
             "_aux_masks",
             "_truncation_masks",
         ]
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
-        state_dicts = ["policy", "actor_optimizer", "critic_optimizer"]
-        return state_dicts, []
+        return ["policy", "actor_optimizer", "critic_optimizer"], []
 
     def learn(
         self: SelfREPPO,

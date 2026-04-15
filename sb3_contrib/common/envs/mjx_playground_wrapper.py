@@ -10,9 +10,8 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.vec_env.base_vec_env import VecEnvIndices, VecEnvObs, VecEnvStepReturn
 
 
-import jax  
-import jax.numpy as jnp  
-_JAX_AVAILABLE = True
+import jax
+import jax.numpy as jnp
 
 
 
@@ -205,12 +204,13 @@ class MjxPlaygroundGymWrapper(gym.Env):
             raise ImportError("mujoco is required for rendering.") from e
 
         mj_model = None
-        for attr in ("sys", "model", "mj_model"):
-            if hasattr(self._env, attr):
-                mj_model = getattr(self._env, attr)
+        for attr in ("mj_model", "model", "sys"):
+            candidate = getattr(self._env, attr, None)
+            if candidate is not None and isinstance(candidate, mujoco.MjModel):
+                mj_model = candidate
                 break
         if mj_model is None:
-            raise RuntimeError("Cannot find MuJoCo model on wrapped environment for rendering.")
+            raise RuntimeError("Cannot find a mujoco.MjModel on the wrapped environment for rendering.")
         self._mj_model = mj_model
         self._mj_data = mujoco.MjData(mj_model)
 
@@ -218,6 +218,11 @@ class MjxPlaygroundGymWrapper(gym.Env):
         if self.render_mode == "rgb_array":
             self._renderer = mujoco.Renderer(mj_model, height=h, width=w)
             self._viewer = None
+            self._tracking_cam = mujoco.MjvCamera()
+            self._tracking_cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            self._tracking_cam.trackbodyid = 1
+            self._tracking_cam.distance = 3.0
+            self._tracking_cam.elevation = -10.0
         else:
             self._renderer = None
             self._viewer = mujoco.viewer.launch_passive(mj_model, self._mj_data)
@@ -226,7 +231,6 @@ class MjxPlaygroundGymWrapper(gym.Env):
         import mujoco
         pipeline_state = getattr(self._state, "pipeline_state", None) or getattr(self._state, "data", None)
         if pipeline_state is None:
-            print(f"[DEBUG] State attrs: {[a for a in dir(self._state) if not a.startswith('_')]}")
             return
         try:
             from mujoco import mjx
@@ -244,7 +248,7 @@ class MjxPlaygroundGymWrapper(gym.Env):
         self._sync_mjx_to_mujoco()
         if self.render_mode == "rgb_array" and self._renderer is not None:
             import mujoco
-            self._renderer.update_scene(self._mj_data)
+            self._renderer.update_scene(self._mj_data, camera=self._tracking_cam)
             return self._renderer.render()
         elif self.render_mode == "human" and self._viewer is not None:
             self._viewer.sync()
@@ -397,8 +401,8 @@ class MjxPlaygroundVecEnv(VecEnv):
         infos: list[dict] = [{} for _ in range(self.num_envs)]
         for i in done_indices:
             infos[i]["terminal_observation"] = (
-                obs_np[i] if isinstance(obs_np, np.ndarray)
-                else {k: v[i] for k, v in obs_np.items()}
+                obs_np[i].copy() if isinstance(obs_np, np.ndarray)
+                else {k: v[i].copy() for k, v in obs_np.items()}
             )
             infos[i]["TimeLimit.truncated"] = bool(truncated_np[i])
             infos[i]["episode"] = {"r": float(self._ep_rewards[i]), "l": int(self._ep_lengths[i])}
