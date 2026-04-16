@@ -1,3 +1,4 @@
+.claude/
 *.swp
 *.pyc
 *.pkl
@@ -24,6 +25,7 @@ keys/
 # Virtualenv
 /env
 /venv
+/.venv
 
 
 *.sublime-project
